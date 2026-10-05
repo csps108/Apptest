@@ -1,0 +1,11 @@
+models:
+  - title: LM Studio Qwen
+    provider: openai
+    model: qwen/qwen3-8b
+    apiBase: http://localhost:1234/v1
+
+tabAutocompleteModel:
+  title: LM Studio Autocomplete
+  provider: openai
+  model: qwen/qwen3-8b
+  apiBase: http://localhost:1234/v1
