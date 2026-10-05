@@ -1,9 +1,42 @@
 import 'dart:typed_data';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:image/image.dart' as img;
 import 'package:image_picker/image_picker.dart';
 import 'package:crop_your_image/crop_your_image.dart';
 
-void main() {
+// ==================== 影像處理（必須是頂層函式，才能丟給 compute） ====================
+Uint8List? applyAlgorithm(Uint8List bytes, String algorithm) {
+  final decoded = img.decodeImage(bytes);
+  if (decoded == null) return null;
+
+  img.Image result;
+  switch (algorithm) {
+    case '灰階化':
+      result = img.grayscale(decoded);
+      break;
+    case '二值化':
+      result = img.luminanceThreshold(img.grayscale(decoded), threshold: 0.5);
+      break;
+    case '邊緣偵測 (Sobel)':
+      result = img.sobel(img.grayscale(decoded));
+      break;
+    case '高斯模糊':
+      result = img.gaussianBlur(decoded, radius: 5);
+      break;
+    default:
+      return null;
+  }
+  return Uint8List.fromList(img.encodeJpg(result, quality: 90));
+}
+
+Uint8List? processInIsolate(Map<String, dynamic> args) =>
+    applyAlgorithm(args['bytes'] as Uint8List, args['algo'] as String);
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await SystemChrome.setPreferredOrientations([DeviceOrientation.portraitUp]);
   runApp(const MyApp());
 }
 
@@ -20,7 +53,7 @@ class MyApp extends StatelessWidget {
 }
 
 // 流程步驟
-enum FlowStep { preview, cropType, algorithm }
+enum FlowStep { preview, cropType, algorithm, result }
 
 // 裁切類型
 enum CropType { none, rectangle, circle }
@@ -33,6 +66,7 @@ class MainScreen extends StatefulWidget {
 }
 
 class _MainScreenState extends State<MainScreen> {
+  final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
   bool isSidebarExpanded = true;
   final ImagePicker _picker = ImagePicker();
   final CropController _cropController = CropController();
@@ -40,28 +74,35 @@ class _MainScreenState extends State<MainScreen> {
   // 圖片
   Uint8List? _imageData; // 目前顯示（可能是裁切後）
   Uint8List? _originalImageData; // 原始照片
+  Uint8List? _resultImage; // 演算法處理結果
 
   // 流程狀態
   FlowStep _step = FlowStep.preview;
-  CropType? _cropType; // 使用者選擇的裁切類型
-  bool _isCropping = false; // 正在裁切畫面中
-  bool _cropDone = false; // 裁切是否已完成（或選擇不裁切）
-  String? _selectedAlgorithm; // 步驟 2 選擇的演算法
+  CropType? _cropType;
+  bool _isCropping = false;
+  bool _cropDone = false;
+  bool _isProcessing = false;
+  String? _selectedAlgorithm;
 
-  // 演算法清單（可自行替換成你的實際演算法）
   final List<Map<String, dynamic>> _algorithms = [
     {'name': '灰階化', 'desc': '將影像轉為灰階', 'icon': Icons.filter_b_and_w},
     {'name': '二值化', 'desc': '依門檻值轉為黑白', 'icon': Icons.contrast},
-    {'name': '邊緣偵測 (Canny)', 'desc': '找出影像邊緣輪廓', 'icon': Icons.border_style},
+    {'name': '邊緣偵測 (Sobel)', 'desc': '找出影像邊緣輪廓', 'icon': Icons.border_style},
     {'name': '高斯模糊', 'desc': '降低雜訊、平滑影像', 'icon': Icons.blur_on},
   ];
 
   // ==================== 拍照 / 重置 ====================
   Future<void> _takePhoto() async {
     try {
-      final XFile? photo = await _picker.pickImage(source: ImageSource.camera);
+      final XFile? photo = await _picker.pickImage(
+        source: ImageSource.camera,
+        maxWidth: 1600,
+        maxHeight: 1600,
+        imageQuality: 90,
+      );
       if (photo != null) {
         final bytes = await photo.readAsBytes();
+        if (!mounted) return;
         setState(() {
           _imageData = bytes;
           _originalImageData = bytes;
@@ -79,7 +120,9 @@ class _MainScreenState extends State<MainScreen> {
     _cropType = null;
     _isCropping = false;
     _cropDone = false;
+    _isProcessing = false;
     _selectedAlgorithm = null;
+    _resultImage = null;
   }
 
   void _clearPhoto() {
@@ -93,6 +136,7 @@ class _MainScreenState extends State<MainScreen> {
 
   // ==================== 上一步 / 下一步 ====================
   bool get _canGoNext {
+    if (_isProcessing) return false;
     switch (_step) {
       case FlowStep.preview:
         return true;
@@ -100,33 +144,36 @@ class _MainScreenState extends State<MainScreen> {
         return _cropType != null && _cropDone && !_isCropping;
       case FlowStep.algorithm:
         return _selectedAlgorithm != null;
+      case FlowStep.result:
+        return true;
     }
   }
 
   void _goNext() {
     if (!_canGoNext) return;
-    setState(() {
-      switch (_step) {
-        case FlowStep.preview:
-          _step = FlowStep.cropType;
-          break;
-        case FlowStep.cropType:
-          _step = FlowStep.algorithm;
-          break;
-        case FlowStep.algorithm:
-          _submit();
-          break;
-      }
-    });
+    switch (_step) {
+      case FlowStep.preview:
+        setState(() => _step = FlowStep.cropType);
+        break;
+      case FlowStep.cropType:
+        setState(() => _step = FlowStep.algorithm);
+        break;
+      case FlowStep.algorithm:
+        _runAlgorithm();
+        break;
+      case FlowStep.result:
+        _clearPhoto(); // 完成，回到主畫面
+        break;
+    }
   }
 
   void _goBack() {
+    if (_isProcessing) return;
     setState(() {
       switch (_step) {
         case FlowStep.preview:
           break;
         case FlowStep.cropType:
-          // 回到檢視照片：還原原圖、清除裁切選擇
           _imageData = _originalImageData;
           _cropType = null;
           _cropDone = false;
@@ -134,25 +181,53 @@ class _MainScreenState extends State<MainScreen> {
           _step = FlowStep.preview;
           break;
         case FlowStep.algorithm:
-          // 回到裁切步驟：保留已裁切的圖與選擇
           _step = FlowStep.cropType;
+          break;
+        case FlowStep.result:
+          _resultImage = null;
+          _step = FlowStep.algorithm;
           break;
       }
     });
   }
 
-  void _submit() {
-    debugPrint('送出：裁切=$_cropType, 演算法=$_selectedAlgorithm');
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('已送出：$_selectedAlgorithm')),
-    );
+  Future<void> _runAlgorithm() async {
+    if (_imageData == null || _selectedAlgorithm == null) return;
+
+    setState(() => _isProcessing = true);
+
+    Uint8List? result;
+    try {
+      result = await compute(processInIsolate, {
+        'bytes': _imageData!,
+        'algo': _selectedAlgorithm!,
+      });
+    } catch (e) {
+      debugPrint('處理失敗：$e');
+    }
+
+    if (!mounted) return;
+
+    if (result == null) {
+      setState(() => _isProcessing = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('影像處理失敗，請重試')),
+      );
+      return;
+    }
+
+    setState(() {
+      _isProcessing = false;
+      _resultImage = result;
+      _step = FlowStep.result;
+    });
   }
 
-  // ==================== 裁切類型選擇 ====================
+  // ==================== 裁切 ====================
   void _selectCropType(CropType type) {
     setState(() {
       _cropType = type;
-      _imageData = _originalImageData; // 每次重選都從原圖開始
+      _imageData = _originalImageData;
       if (type == CropType.none) {
         _cropDone = true;
         _isCropping = false;
@@ -172,7 +247,85 @@ class _MainScreenState extends State<MainScreen> {
     });
   }
 
-  // ==================== UI 元件 ====================
+  // ==================== UI：側欄 ====================
+  Widget _buildSidebarContent(bool expanded) {
+    return Column(
+      children: [
+        const SizedBox(height: 40),
+        SingleChildScrollView(
+          scrollDirection: Axis.horizontal,
+          physics: const NeverScrollableScrollPhysics(),
+          child: SizedBox(
+            width: expanded ? 200 : 70,
+            child: Column(
+              children: [
+                const CircleAvatar(
+                  radius: 20,
+                  backgroundColor: Colors.blue,
+                  child: Icon(Icons.person, color: Colors.white),
+                ),
+                if (expanded) ...[
+                  const SizedBox(height: 12),
+                  const Text('User',
+                      style:
+                          TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 4),
+                  const Text('Dept',
+                      style: TextStyle(fontSize: 14, color: Colors.grey)),
+                ],
+              ],
+            ),
+          ),
+        ),
+        const SizedBox(height: 20),
+        const Divider(height: 1),
+        const SizedBox(height: 10),
+      ],
+    );
+  }
+
+  // 平板 / 桌面：可收合側欄
+  Widget _buildSidebar() {
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 300),
+      width: isSidebarExpanded ? 200 : 70,
+      color: Colors.grey.shade200,
+      child: Column(
+        children: [
+          _buildSidebarContent(isSidebarExpanded),
+          IconButton(
+            icon: const Icon(Icons.menu),
+            onPressed: () =>
+                setState(() => isSidebarExpanded = !isSidebarExpanded),
+          ),
+          const SizedBox(height: 20),
+          Icon(Icons.home, color: Colors.grey.shade600),
+        ],
+      ),
+    );
+  }
+
+  // 手機：抽屜
+  Widget _buildDrawer() {
+    return Drawer(
+      width: 220,
+      child: Container(
+        color: Colors.grey.shade200,
+        child: Column(
+          children: [
+            _buildSidebarContent(true),
+            ListTile(
+              leading: Icon(Icons.home, color: Colors.grey.shade700),
+              title: const Text('首頁'),
+              onTap: () => Navigator.of(context).pop(),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  // ==================== UI：標題與底部導覽 ====================
   Widget _buildHeader() {
     String title;
     String? subtitle;
@@ -188,21 +341,30 @@ class _MainScreenState extends State<MainScreen> {
         title = '選擇演算法';
         subtitle = '步驟 2 / 2';
         break;
+      case FlowStep.result:
+        title = '處理結果';
+        break;
     }
 
     return Container(
       width: double.infinity,
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 10),
       color: Colors.white,
       child: Row(
         children: [
-          if (_step == FlowStep.preview)
-            TextButton.icon(
-              onPressed: _clearPhoto,
-              icon: const Icon(Icons.close, color: Colors.redAccent),
-              label: const Text('取消重拍',
-                  style: TextStyle(color: Colors.redAccent, fontSize: 16)),
-            ),
+          SizedBox(
+            width: 110,
+            child: _step == FlowStep.preview
+                ? TextButton.icon(
+                    onPressed: _clearPhoto,
+                    icon: const Icon(Icons.close,
+                        size: 18, color: Colors.redAccent),
+                    label: const Text('取消重拍',
+                        style:
+                            TextStyle(color: Colors.redAccent, fontSize: 14)),
+                  )
+                : null,
+          ),
           Expanded(
             child: Column(
               children: [
@@ -215,15 +377,31 @@ class _MainScreenState extends State<MainScreen> {
               ],
             ),
           ),
-          if (_step == FlowStep.preview) const SizedBox(width: 100),
+          const SizedBox(width: 110),
         ],
       ),
     );
   }
 
   Widget _buildBottomNav() {
-    final bool isLast = _step == FlowStep.algorithm;
     final bool isFirst = _step == FlowStep.preview;
+    final bool isResult = _step == FlowStep.result;
+
+    String nextLabel;
+    switch (_step) {
+      case FlowStep.preview:
+        nextLabel = '確認';
+        break;
+      case FlowStep.cropType:
+        nextLabel = '下一步';
+        break;
+      case FlowStep.algorithm:
+        nextLabel = '套用';
+        break;
+      case FlowStep.result:
+        nextLabel = '完成';
+        break;
+    }
 
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
@@ -231,7 +409,7 @@ class _MainScreenState extends State<MainScreen> {
         color: Colors.white,
         boxShadow: [
           BoxShadow(
-            color: Colors.black.withOpacity(0.06),
+            color: Colors.black.withAlpha(20),
             blurRadius: 6,
             offset: const Offset(0, -2),
           ),
@@ -240,11 +418,10 @@ class _MainScreenState extends State<MainScreen> {
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
-          // 上一步（檢視照片階段不顯示）
           isFirst
               ? const SizedBox(width: 100)
               : OutlinedButton.icon(
-                  onPressed: _goBack,
+                  onPressed: _isProcessing ? null : _goBack,
                   icon: const Icon(Icons.arrow_back_ios, size: 16),
                   label: const Text('上一步'),
                   style: OutlinedButton.styleFrom(
@@ -252,17 +429,16 @@ class _MainScreenState extends State<MainScreen> {
                         borderRadius: BorderRadius.circular(20)),
                   ),
                 ),
-          // 下一步 / 確認 / 送出
           ElevatedButton(
             onPressed: _canGoNext ? _goNext : null,
             style: ElevatedButton.styleFrom(
-              backgroundColor: Colors.blue,
+              backgroundColor: isResult ? Colors.green : Colors.blue,
               disabledBackgroundColor: Colors.grey.shade300,
               shape: RoundedRectangleBorder(
                   borderRadius: BorderRadius.circular(20)),
             ),
             child: Text(
-              isFirst ? '確認' : (isLast ? '送出' : '下一步'),
+              nextLabel,
               style: const TextStyle(color: Colors.white, fontSize: 16),
             ),
           ),
@@ -271,14 +447,14 @@ class _MainScreenState extends State<MainScreen> {
     );
   }
 
-  // 一般圖片顯示（圓形裁切後用 ClipOval 顯示）
-  Widget _buildImageView() {
+  // ==================== UI：圖片 / 裁切 ====================
+  Widget _buildImageView({Uint8List? data}) {
+    final bytes = data ?? _imageData!;
     final bool showCircle = _cropType == CropType.circle && _cropDone;
-    final image = Image.memory(_imageData!, fit: BoxFit.contain);
+    final image = Image.memory(bytes, fit: BoxFit.contain);
     return Center(child: showCircle ? ClipOval(child: image) : image);
   }
 
-  // 裁切畫面
   Widget _buildCropper() {
     final bool isCircle = _cropType == CropType.circle;
     return Stack(
@@ -328,6 +504,7 @@ class _MainScreenState extends State<MainScreen> {
     );
   }
 
+  // 演算法清單用的卡片
   Widget _buildOptionCard({
     required IconData icon,
     required String title,
@@ -337,7 +514,7 @@ class _MainScreenState extends State<MainScreen> {
   }) {
     return Card(
       elevation: selected ? 3 : 0,
-      margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
+      margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
       shape: RoundedRectangleBorder(
         borderRadius: BorderRadius.circular(14),
         side: BorderSide(
@@ -347,12 +524,44 @@ class _MainScreenState extends State<MainScreen> {
       ),
       child: ListTile(
         onTap: onTap,
-        leading: Icon(icon, color: selected ? Colors.blue : Colors.grey, size: 30),
+        leading:
+            Icon(icon, color: selected ? Colors.blue : Colors.grey, size: 28),
         title: Text(title, style: const TextStyle(fontWeight: FontWeight.bold)),
         subtitle: Text(desc),
         trailing: selected
             ? const Icon(Icons.check_circle, color: Colors.blue)
             : const Icon(Icons.radio_button_unchecked, color: Colors.grey),
+      ),
+    );
+  }
+
+  // 裁切類型用的橫向小按鈕（省垂直空間）
+  Widget _buildCompactOption(
+      IconData icon, String label, bool selected, VoidCallback onTap) {
+    return Expanded(
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(14),
+        child: Container(
+          margin: const EdgeInsets.symmetric(horizontal: 6),
+          padding: const EdgeInsets.symmetric(vertical: 12),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(14),
+            border: Border.all(
+              color: selected ? Colors.blue : Colors.grey.shade300,
+              width: selected ? 2 : 1,
+            ),
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(icon,
+                  color: selected ? Colors.blue : Colors.grey, size: 28),
+              const SizedBox(height: 4),
+              Text(label, style: const TextStyle(fontSize: 13)),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -364,29 +573,22 @@ class _MainScreenState extends State<MainScreen> {
     return Column(
       children: [
         Expanded(child: _buildImageView()),
-        const SizedBox(height: 8),
-        _buildOptionCard(
-          icon: Icons.crop_square,
-          title: '矩形裁切',
-          desc: '自由調整矩形範圍',
-          selected: _cropType == CropType.rectangle,
-          onTap: () => _selectCropType(CropType.rectangle),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+          child: Row(
+            children: [
+              _buildCompactOption(Icons.crop_square, '矩形',
+                  _cropType == CropType.rectangle,
+                  () => _selectCropType(CropType.rectangle)),
+              _buildCompactOption(Icons.lens_outlined, '圓形',
+                  _cropType == CropType.circle,
+                  () => _selectCropType(CropType.circle)),
+              _buildCompactOption(Icons.image_outlined, '不裁切',
+                  _cropType == CropType.none,
+                  () => _selectCropType(CropType.none)),
+            ],
+          ),
         ),
-        _buildOptionCard(
-          icon: Icons.lens_outlined,
-          title: '圓形裁切',
-          desc: '以 1:1 圓形範圍裁切',
-          selected: _cropType == CropType.circle,
-          onTap: () => _selectCropType(CropType.circle),
-        ),
-        _buildOptionCard(
-          icon: Icons.image_outlined,
-          title: '不裁切',
-          desc: '直接使用原始照片',
-          selected: _cropType == CropType.none,
-          onTap: () => _selectCropType(CropType.none),
-        ),
-        const SizedBox(height: 8),
       ],
     );
   }
@@ -395,10 +597,11 @@ class _MainScreenState extends State<MainScreen> {
   Widget _buildAlgorithmStep() {
     return Column(
       children: [
-        SizedBox(height: 180, child: _buildImageView()),
-        const Divider(),
+        SizedBox(height: 160, child: _buildImageView()),
+        const Divider(height: 1),
         Expanded(
           child: ListView(
+            padding: const EdgeInsets.symmetric(vertical: 6),
             children: _algorithms.map((algo) {
               return _buildOptionCard(
                 icon: algo['icon'] as IconData,
@@ -415,6 +618,22 @@ class _MainScreenState extends State<MainScreen> {
     );
   }
 
+  // 結果頁
+  Widget _buildResultStep() {
+    return Column(
+      children: [
+        Expanded(child: _buildImageView(data: _resultImage ?? _imageData)),
+        Padding(
+          padding: const EdgeInsets.all(12),
+          child: Text(
+            '已套用：${_selectedAlgorithm ?? ''}',
+            style: TextStyle(fontSize: 14, color: Colors.grey.shade700),
+          ),
+        ),
+      ],
+    );
+  }
+
   Widget _buildContent() {
     if (_imageData == null) {
       return const Center(
@@ -422,105 +641,105 @@ class _MainScreenState extends State<MainScreen> {
             style: TextStyle(fontSize: 24, color: Colors.grey)),
       );
     }
+
+    Widget content;
     switch (_step) {
       case FlowStep.preview:
-        return _buildImageView();
+        content = _buildImageView();
+        break;
       case FlowStep.cropType:
-        return _buildCropTypeStep();
+        content = _buildCropTypeStep();
+        break;
       case FlowStep.algorithm:
-        return _buildAlgorithmStep();
+        content = _buildAlgorithmStep();
+        break;
+      case FlowStep.result:
+        content = _buildResultStep();
+        break;
     }
+
+    // 處理中的遮罩
+    return Stack(
+      children: [
+        Positioned.fill(child: content),
+        if (_isProcessing)
+          Positioned.fill(
+            child: Container(
+              color: Colors.black38,
+              child: const Center(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    CircularProgressIndicator(),
+                    SizedBox(height: 12),
+                    Text('處理中...',
+                        style: TextStyle(color: Colors.white, fontSize: 16)),
+                  ],
+                ),
+              ),
+            ),
+          ),
+      ],
+    );
+  }
+
+  // 主畫面頂部搜尋列
+  Widget _buildSearchBar(bool isPhone) {
+    return Padding(
+      padding: const EdgeInsets.all(12.0),
+      child: Row(
+        children: [
+          if (isPhone)
+            IconButton(
+              icon: const Icon(Icons.menu),
+              onPressed: () => _scaffoldKey.currentState?.openDrawer(),
+            ),
+          Expanded(
+            child: TextField(
+              decoration: InputDecoration(
+                hintText: '搜尋...',
+                prefixIcon: const Icon(Icons.search),
+                suffixIcon: IconButton(
+                  icon: const Icon(Icons.camera_alt, color: Colors.blue),
+                  onPressed: _takePhoto,
+                ),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(30.0),
+                ),
+                contentPadding: const EdgeInsets.symmetric(horizontal: 20),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
+    final bool isPhone = MediaQuery.of(context).size.width < 600;
+
     return Scaffold(
-      body: Row(
-        children: [
-          // ==================== 左側縮放欄位 ====================
-          AnimatedContainer(
-            duration: const Duration(milliseconds: 300),
-            width: isSidebarExpanded ? 200 : 70,
-            color: Colors.grey.shade200,
-            child: Column(
-              children: [
-                const SizedBox(height: 40),
-                SingleChildScrollView(
-                  scrollDirection: Axis.horizontal,
-                  physics: const NeverScrollableScrollPhysics(),
-                  child: SizedBox(
-                    width: isSidebarExpanded ? 200 : 70,
-                    child: Column(
-                      children: [
-                        const CircleAvatar(
-                          radius: 20,
-                          backgroundColor: Colors.blue,
-                          child: Icon(Icons.person, color: Colors.white),
-                        ),
-                        if (isSidebarExpanded) ...[
-                          const SizedBox(height: 12),
-                          const Text('User',
-                              style: TextStyle(
-                                  fontSize: 18, fontWeight: FontWeight.bold)),
-                          const SizedBox(height: 4),
-                          const Text('Dept',
-                              style:
-                                  TextStyle(fontSize: 14, color: Colors.grey)),
-                        ],
-                      ],
-                    ),
-                  ),
-                ),
-                const SizedBox(height: 20),
-                const Divider(height: 1),
-                const SizedBox(height: 10),
-                IconButton(
-                  icon: const Icon(Icons.menu),
-                  onPressed: () =>
-                      setState(() => isSidebarExpanded = !isSidebarExpanded),
-                ),
-                const SizedBox(height: 20),
-                Icon(Icons.home, color: Colors.grey.shade600),
-              ],
+      key: _scaffoldKey,
+      drawer: isPhone ? _buildDrawer() : null,
+      body: SafeArea(
+        child: Row(
+          children: [
+            if (!isPhone) _buildSidebar(),
+            Expanded(
+              child: Column(
+                children: [
+                  if (_imageData == null)
+                    _buildSearchBar(isPhone)
+                  else
+                    _buildHeader(),
+                  Expanded(child: _buildContent()),
+                  if (_imageData != null && !_isCropping) _buildBottomNav(),
+                ],
+              ),
             ),
-          ),
-
-          // ==================== 中間主內容區塊 ====================
-          Expanded(
-            child: Column(
-              children: [
-                // 頂部
-                if (_imageData == null)
-                  Padding(
-                    padding: const EdgeInsets.all(16.0),
-                    child: TextField(
-                      decoration: InputDecoration(
-                        hintText: '搜尋...',
-                        prefixIcon: const Icon(Icons.search),
-                        suffixIcon: IconButton(
-                          icon: const Icon(Icons.camera_alt, color: Colors.blue),
-                          onPressed: _takePhoto,
-                        ),
-                        border: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(30.0),
-                        ),
-                        contentPadding:
-                            const EdgeInsets.symmetric(horizontal: 20),
-                      ),
-                    ),
-                  )
-                else
-                  _buildHeader(),
-
-                // 中間內容
-                Expanded(child: _buildContent()),
-
-                // 底部 上一步 / 下一步（裁切中不顯示）
-                if (_imageData != null && !_isCropping) _buildBottomNav(),
-              ],
-            ),
-          ),
-        ],
+          ],
+        ),
       ),
     );
   }
